@@ -30,7 +30,18 @@ describe('NextRunsPreview', () => {
     expect(rows[0]?.textContent).toBe('Fri 16:00in 4d')
   })
 
-  it('describes the poll for a github kind', () => {
+  it('a one-time schedule shows its single run however far ahead, and says when it has passed (#771)', () => {
+    const { container } = render(
+      <NextRunsPreview kind="schedule" schedule={{ type: 'once', date: '2026-11-20', hour: 23 }} intervalSeconds={300} timeZone="Europe/Warsaw" now={NOW} />,
+    )
+    expect(screen.getByText('Runs once')).not.toBeNull()
+    expect(container.querySelectorAll('[data-slot="next-run"]')).toHaveLength(1)
+    cleanup()
+    render(<NextRunsPreview kind="schedule" schedule={{ type: 'once', date: '2026-09-01', hour: 23 }} intervalSeconds={300} timeZone="Europe/Warsaw" now={NOW} />)
+    expect(screen.getByText('This time has already passed.')).not.toBeNull()
+  })
+
+    it('describes the poll for a github kind', () => {
     render(<NextRunsPreview kind="github" schedule={{ type: 'daily' }} intervalSeconds={600} timeZone="Europe/Warsaw" now={NOW} />)
     expect(screen.getByText('How it polls')).not.toBeNull()
     expect(screen.getByText(/Checks GitHub every 10 min while cezar is open/)).not.toBeNull()

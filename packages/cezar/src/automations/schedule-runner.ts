@@ -17,6 +17,11 @@ import type { AutomationLogRecord, AutomationReceipt, ScheduleAutomationDefiniti
  * or a re-armed timer, meets the receipt and logs `duplicate` — never a second launch. A held
  * lease and a duplicate are not failures; they advance this process's own `nextRunAt` and do not
  * count towards the three-strike auto-pause.
+ *
+ * A `once` schedule (#771) has a single occurrence: the same age rule fires it on time, as a
+ * catch-up within a day, or skips it — and whichever of those consumed it, the automation is then
+ * paused (`retireOnce`), so it never sits "enabled" with nothing left to fire. Edit the date and
+ * enable it again to reuse it.
  */
 
 export const SCHEDULE_GRACE_MS = 10 * 60_000;
@@ -92,6 +97,7 @@ export class ScheduleRunner {
     }
     this.logSkipped(definition, missed.length, null);
     this.advance(definition, now, now);
+    this.retireOnce(definition);
     return { result: 'skipped', occurrenceAt: new Date(latest).toISOString() };
   }
 
@@ -183,6 +189,7 @@ export class ScheduleRunner {
         consecutiveFailures: 0,
       }));
       this.handle.onChange?.(definition.id, definition.revision);
+      if (options.advance) this.retireOnce(definition);
       return { result, runId: launched.runId, occurrenceAt: occurrence.at };
     } catch (error) {
       // Do not let an owner that lost its guard publish failure state after a
@@ -217,6 +224,20 @@ export class ScheduleRunner {
       return;
     }
     this.handle.onChange?.(definition.id, definition.revision);
+    if (advance) this.retireOnce(definition);
+  }
+
+  /**
+   * Pause a `once` automation whose single occurrence was just consumed. Best-effort: a revision
+   * conflict means another process (or the user) changed it first, and their write wins.
+   */
+  private retireOnce(definition: ScheduleAutomationDefinition): void {
+    if (definition.schedule.type !== 'once' || !definition.enabled) return;
+    const { id, revision, createdAt: _c, updatedAt: _u, ...editable } = definition;
+    try {
+      const paused = this.handle.store.update(id, revision, { ...editable, enabled: false });
+      this.handle.onChange?.(id, paused.revision);
+    } catch { /* changed concurrently — leave it to whoever changed it */ }
   }
 
   private advance(definition: ScheduleAutomationDefinition, fromMs: number, now: number): void {
