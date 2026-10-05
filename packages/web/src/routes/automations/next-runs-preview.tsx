@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 
-import { occurrencesBetween, type AutomationKind, type AutomationSchedule } from '@open-mercato/cezar-api-client'
+import { nextOccurrence, occurrencesBetween, type AutomationKind, type AutomationSchedule } from '@open-mercato/cezar-api-client'
 import { Card } from '@/components/ui/card'
 import { dayTime, relativeIn } from '@/lib/automation-format'
 
@@ -32,11 +32,17 @@ export function NextRunsPreview({
     return () => clearInterval(timer)
   }, [now])
   const at = now ?? tick
-  const runs = useMemo(
-    // A `once` is a single instant however far ahead; the recurring shapes all repeat within nine days.
-    () => (kind === 'schedule' ? occurrencesBetween(schedule, at, at + (schedule.type === 'once' ? 3_660 : 9) * DAY, timeZone, 5) : []),
-    [kind, schedule, at, timeZone],
-  )
+  const runs = useMemo(() => {
+    if (kind !== 'schedule') return []
+    // A `once` is a single instant however far ahead, so it takes no window at all — any window
+    // would report a date past its far edge as already passed. The recurring shapes all repeat
+    // within nine days.
+    if (schedule.type === 'once') {
+      const next = nextOccurrence(schedule, at, timeZone)
+      return next === null ? [] : [next]
+    }
+    return occurrencesBetween(schedule, at, at + 9 * DAY, timeZone, 5)
+  }, [kind, schedule, at, timeZone])
   return (
     <Card flush data-slot="next-runs-preview" className="pt-3 pb-2">
       <div className="px-3.5 pb-2 text-[11px] font-semibold tracking-[.05em] uppercase text-soft-foreground">
@@ -50,7 +56,7 @@ export function NextRunsPreview({
         </p>
       ) : runs.length === 0 ? (
         <p className="m-0 px-3.5 pb-1.5 text-[12.5px] leading-[1.5] text-muted-foreground">
-          {schedule.type === 'once' ? 'This time has already passed.' : 'Nothing in the next nine days.'}
+          {schedule.type !== 'once' ? 'Nothing in the next nine days.' : schedule.date ? 'This time has already passed.' : 'Pick a date.'}
         </p>
       ) : (
         runs.map((ms) => (

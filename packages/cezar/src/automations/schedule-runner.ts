@@ -20,13 +20,16 @@ import type { AutomationLogRecord, AutomationReceipt, ScheduleAutomationDefiniti
  *
  * A `once` schedule (#771) has a single occurrence: the same age rule fires it on time, as a
  * catch-up within a day, or skips it — and whichever of those consumed it, the automation is then
- * paused (`retireOnce`), so it never sits "enabled" with nothing left to fire. Edit the date and
- * enable it again to reuse it.
+ * paused (`retireOnce`) with a log row saying why, so it never sits "enabled" with nothing left to
+ * fire. That covers a `duplicate` and a detection-only fire too: both consume the occurrence's
+ * receipt. Edit the date and enable it again to reuse it.
  */
 
 export const SCHEDULE_GRACE_MS = 10 * 60_000;
 export const SCHEDULE_CATCH_UP_MS = 24 * 60 * 60_000;
 export const SCHEDULE_AUTO_PAUSE_AFTER = 3;
+/** The log row that explains why a consumed `once` is paused (`retireOnce`). */
+export const ONCE_RETIRED_REASON = 'Paused: this one-time schedule has used its only occurrence. Pick a later date and enable it again to reuse it.';
 
 export type ScheduleTrigger = 'schedule' | 'catch-up' | 'manual';
 
@@ -143,7 +146,11 @@ export class ScheduleRunner {
       const receipt = store.reserveReceipt({ automationId: definition.id, revision: definition.revision, eventId, occurrenceAt: occurrence.at });
       if (!receipt) {
         store.appendLog({ automationId: definition.id, revision: definition.revision, result: 'duplicate', reason: `A durable receipt already exists for the ${occurrence.at} occurrence.` });
-        if (options.advance) this.advance(definition, Date.parse(occurrence.at), now);
+        if (options.advance) {
+          this.advance(definition, Date.parse(occurrence.at), now);
+          // The receipt already consumed this occurrence, so a `once` has nothing left to fire.
+          this.retireOnce(definition);
+        }
         return { result: 'duplicate', occurrenceAt: occurrence.at };
       }
       return await this.launchReserved(definition, occurrence, receipt, now, options, lease);
@@ -164,7 +171,11 @@ export class ScheduleRunner {
     const { store } = this.handle;
     if (!this.handle.launch) {
       store.appendReceipt({ ...receipt, status: 'launch-error', error: 'This cockpit cannot launch tasks.', updatedAt: new Date(now).toISOString() });
-      if (options.advance) this.advance(definition, Date.parse(occurrence.at), now);
+      if (options.advance) {
+        this.advance(definition, Date.parse(occurrence.at), now);
+        // The `launch-error` receipt stays retryable from the log, as for a failed launch.
+        this.retireOnce(definition);
+      }
       return { result: 'detection-only', occurrenceAt: occurrence.at };
     }
     const started = Date.now();
@@ -228,16 +239,27 @@ export class ScheduleRunner {
   }
 
   /**
-   * Pause a `once` automation whose single occurrence was just consumed. Best-effort: a revision
-   * conflict means another process (or the user) changed it first, and their write wins.
+   * Pause a `once` automation whose single occurrence was just consumed, and say so in the log.
+   * Best-effort: a revision conflict (or a delete) means another process or the user changed it
+   * first, and their write wins. Any other failure — a mutation lease held by a launch elsewhere —
+   * leaves it enabled with nothing left to fire, so that state gets an `error` row explaining it.
+   * Never throws: it runs inside `launchReserved`'s try, after the task already launched.
    */
   private retireOnce(definition: ScheduleAutomationDefinition): void {
     if (definition.schedule.type !== 'once' || !definition.enabled) return;
+    const { store } = this.handle;
     const { id, revision, createdAt: _c, updatedAt: _u, ...editable } = definition;
+    let row: Parameters<AutomationStore['appendLog']>[0];
     try {
-      const paused = this.handle.store.update(id, revision, { ...editable, enabled: false });
+      const paused = store.update(id, revision, { ...editable, enabled: false });
       this.handle.onChange?.(id, paused.revision);
-    } catch { /* changed concurrently — leave it to whoever changed it */ }
+      row = { automationId: id, revision: paused.revision, result: 'skipped', reason: ONCE_RETIRED_REASON };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === 'automation revision conflict' || message === 'automation not found') return;
+      row = { automationId: id, revision, result: 'error', reason: `Could not pause this one-time schedule after its occurrence (${message}); it stays enabled with nothing left to fire. Pause it, or pick a later date.` };
+    }
+    try { store.appendLog(row); } catch { /* an unwritable log must not undo a launch that already happened */ }
   }
 
   private advance(definition: ScheduleAutomationDefinition, fromMs: number, now: number): void {

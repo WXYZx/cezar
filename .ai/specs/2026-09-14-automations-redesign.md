@@ -751,9 +751,13 @@ time in the server's zone like every other shape.
 - **Lifecycle**: the age rule above applies unchanged — on time it fires `scheduled`, within 24 h
   as one `catch-up`, older it is `skipped`. That is the boot-storm bound #770's review asked for:
   N postponed tasks missed during a long closure launch nothing. Whichever way the occurrence is
-  consumed (launched, caught up, skipped, or a failed launch whose receipt stays retryable), the
-  runner then pauses the automation, so it never sits enabled with nothing to fire. Run now
-  neither consumes nor pauses it.
+  consumed (launched, caught up, skipped, met as a `duplicate` receipt, written as a detection-only
+  `launch-error`, or a failed launch — those two receipts stay retryable from the log), the runner
+  then pauses the automation, so it never sits enabled with nothing to fire, and appends a
+  `skipped` log row saying why. If the pause itself cannot be written (a mutation lease held
+  elsewhere), an `error` row says the automation is still enabled with nothing left to fire; a
+  revision conflict means the user changed it first and stays silent. Run now neither consumes
+  nor pauses it.
 - **CLI**: `cez automation add --at "YYYY-MM-DD HH:MM"`; Copy as CLI prints `--at` for a `once`.
 - **Cockpit**: a `Once` chip with a date picker (default: tomorrow), no cron row, a note when the
   time has passed; the preview shows the single run however far ahead it is.

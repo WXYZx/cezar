@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AutomationStore } from './store.ts';
-import { SCHEDULE_AUTO_PAUSE_AFTER, ScheduleRunner } from './schedule-runner.ts';
+import { ONCE_RETIRED_REASON, SCHEDULE_AUTO_PAUSE_AFTER, ScheduleRunner } from './schedule-runner.ts';
 import type { ScheduleAutomationDefinition } from './types.ts';
 
 const dirs: string[] = [];
@@ -208,6 +208,11 @@ describe('ScheduleRunner — once (#771)', () => {
     expect(launch).toHaveBeenCalledTimes(1);
     expect(store.state('nightly')?.nextRunAt).toBeUndefined();
     expect(store.get('nightly')).toMatchObject({ enabled: false, revision: definition.revision + 1 });
+    // The log says why it paused, right after the launch.
+    expect(store.logs({ automationId: 'nightly' }).map((row) => [row.result, row.reason])).toEqual([
+      ['skipped', ONCE_RETIRED_REASON],
+      ['launched', expect.stringContaining('Scheduled run at')],
+    ]);
     // Paused and spent: nothing is due any more, even if the timer asked.
     expect(runner.dueAt(store.get('nightly') as ScheduleAutomationDefinition)).toBeNull();
   });
@@ -227,7 +232,10 @@ describe('ScheduleRunner — once (#771)', () => {
     clock.set(FIRST_RUN + 3 * DAY);
     expect((await runner.fire(definition)).result).toBe('skipped');
     expect(launch).not.toHaveBeenCalled();
-    expect(store.logs({ automationId: 'nightly' })[0]).toMatchObject({ result: 'skipped' });
+    expect(store.logs({ automationId: 'nightly' }).map((row) => row.reason)).toEqual([
+      ONCE_RETIRED_REASON,
+      expect.stringContaining('Missed 1 occurrence '),
+    ]);
     expect(store.get('nightly')?.enabled).toBe(false);
   });
 
@@ -239,6 +247,64 @@ describe('ScheduleRunner — once (#771)', () => {
     expect((await runner.fire(definition)).result).toBe('failed');
     expect(store.get('nightly')?.enabled).toBe(false);
     expect([...store.latestReceipts().values()][0]).toMatchObject({ status: 'launch-error' });
+  });
+
+  it('pauses when an existing receipt already consumed the occurrence (duplicate)', async () => {
+    const { store, definition, runner, launch, clock } = await setup(ONCE);
+    runner.dueAt(definition);
+    clock.set(FIRST_RUN + 1_000);
+    store.reserveReceipt({ automationId: 'nightly', revision: 1, eventId: `schedule:${new Date(FIRST_RUN).toISOString()}` });
+    expect((await runner.fire(definition)).result).toBe('duplicate');
+    expect(launch).not.toHaveBeenCalled();
+    expect(store.get('nightly')?.enabled).toBe(false);
+    expect(store.logs({ automationId: 'nightly' }).map((row) => row.result)).toEqual(['skipped', 'duplicate']);
+  });
+
+  it('pauses when the cockpit cannot launch (detection-only); the receipt stays retryable', async () => {
+    const { store, definition, clock } = await setup(ONCE);
+    const runner = new ScheduleRunner({ projectId: 'p', store, timeZone: 'UTC', now: clock.now });
+    runner.dueAt(definition);
+    clock.set(FIRST_RUN + 1_000);
+    expect((await runner.fire(definition)).result).toBe('detection-only');
+    expect(store.get('nightly')?.enabled).toBe(false);
+    expect([...store.latestReceipts().values()][0]).toMatchObject({ status: 'launch-error' });
+  });
+
+  it('logs an error, not silence, when the pause itself is blocked by a held mutation lease', async () => {
+    const { store, definition, runner, launch, clock } = await setup(ONCE);
+    let mutation: ReturnType<AutomationStore['acquireMutationLease']>;
+    launch.mockImplementationOnce(async () => {
+      mutation = store.acquireMutationLease();
+      return { runId: 'run-1' };
+    });
+    runner.dueAt(definition);
+    clock.set(FIRST_RUN + 1_000);
+    try {
+      expect(await runner.fire(definition)).toMatchObject({ result: 'launched', runId: 'run-1' });
+    } finally {
+      mutation?.release();
+    }
+    expect(mutation).toBeDefined();
+    // The launch stands; the automation could not be paused, and the log says so.
+    expect(store.latestReceipts().get(`nightly:schedule:${new Date(FIRST_RUN).toISOString()}`)).toMatchObject({ status: 'launched', runId: 'run-1' });
+    expect(store.get('nightly')?.enabled).toBe(true);
+    expect(store.logs({ automationId: 'nightly' })[0]).toMatchObject({
+      result: 'error',
+      reason: expect.stringContaining('automation mutation conflict'),
+    });
+  });
+
+  it('stays silent when the user changed it first — their write wins', async () => {
+    const { store, definition, runner, launch, clock } = await setup(ONCE);
+    launch.mockImplementationOnce(async () => {
+      store.update('nightly', 1, { name: 'Renamed', enabled: true, kind: 'schedule', schedule: { ...ONCE, date: '2026-09-20' }, task: definition.task });
+      return { runId: 'run-1' };
+    });
+    runner.dueAt(definition);
+    clock.set(FIRST_RUN + 1_000);
+    expect((await runner.fire(definition)).result).toBe('launched');
+    expect(store.get('nightly')).toMatchObject({ enabled: true, name: 'Renamed' });
+    expect(store.logs({ automationId: 'nightly' }).map((row) => row.result)).toEqual(['launched']);
   });
 
   it('Run now launches it by hand without pausing or consuming it', async () => {
