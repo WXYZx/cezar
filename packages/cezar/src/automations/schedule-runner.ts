@@ -1,3 +1,4 @@
+import { fireDeferred } from './deferred-lifecycle.ts';
 import { nextOccurrence, occurrencesBetween } from '@open-mercato/cezar-contract';
 import type { AutomationStore } from './store.ts';
 import type { AutomationLogRecord, AutomationReceipt, ScheduleAutomationDefinition } from './types.ts';
@@ -15,8 +16,8 @@ import type { AutomationLogRecord, AutomationReceipt, ScheduleAutomationDefiniti
  *
  * Receipts are per occurrence (`schedule:<instant>`), so a second cockpit on the same project,
  * or a re-armed timer, meets the receipt and logs `duplicate` — never a second launch. A held
- * lease and a duplicate are not failures; they advance this process's own `nextRunAt` and do not
- * count towards the three-strike auto-pause.
+ * lease and a duplicate are not failures and do not count towards the three-strike auto-pause.
+ * Only a duplicate consumes the occurrence; contention retains it for a bounded retry.
  *
  * A `once` schedule (#771) has a single occurrence: the same age rule fires it on time, as a
  * catch-up within a day, or skips it — and whichever of those consumed it, the automation is then
@@ -54,6 +55,9 @@ export interface ScheduleRunnerHandle {
   launch?: ScheduleLauncher;
   onChange?: (automationId: string, revision: number) => void;
   now?: () => number;
+  validateDeferred?: (definition: ScheduleAutomationDefinition) => Promise<void>;
+  deferredHoldUntil?: (definition: ScheduleAutomationDefinition) => Promise<number | null>;
+  deferredRunIds?: (automationId: string, ids: string[]) => Promise<string[]>;
 }
 
 export type ScheduleFireOutcome =
@@ -73,6 +77,10 @@ export class ScheduleRunner {
    * occurrence after now, which is then persisted so every process agrees on it.
    */
   dueAt(definition: ScheduleAutomationDefinition): number | null {
+    if (definition.deferredStart) {
+      const saved = definition.deferredStart;
+      return definition.enabled ? Math.max(saved.manualRequested ? 0 : Date.parse(saved.notBefore), saved.holdUntil ? Date.parse(saved.holdUntil) : 0) : null;
+    }
     const state = this.handle.store.state(definition.id) ?? {};
     if (state.nextRunAt) return Date.parse(state.nextRunAt);
     const next = nextOccurrence(definition.schedule, this.now(), this.handle.timeZone);
@@ -83,6 +91,7 @@ export class ScheduleRunner {
 
   /** The timer fired (or boot found a past-due occurrence): apply the age rule and launch. */
   async fire(definition: ScheduleAutomationDefinition): Promise<ScheduleFireOutcome> {
+    if (definition.deferredStart) return fireDeferred(this.handle, definition, false);
     const now = this.now();
     const due = this.dueAt(definition);
     if (due === null) return { result: 'skipped' };
@@ -106,12 +115,14 @@ export class ScheduleRunner {
 
   /** `POST /automations/:id/run`: fire now, by hand, paused or not; `nextRunAt` is untouched. */
   async runNow(definition: ScheduleAutomationDefinition): Promise<ScheduleFireOutcome> {
+    if (definition.deferredStart) return fireDeferred(this.handle, definition, true);
     const now = this.now();
     return this.launch(definition, { at: new Date(now).toISOString(), trigger: 'manual' }, now, { advance: false });
   }
 
   /** Retry a `launch-error` receipt of this kind: the same receipt, fired again by hand. */
   async retry(definition: ScheduleAutomationDefinition, receipt: AutomationReceipt): Promise<ScheduleFireOutcome> {
+    if (definition.deferredStart) return fireDeferred(this.handle, definition, true);
     const now = this.now();
     const occurrence: ScheduleOccurrence = { at: receipt.occurrenceAt ?? new Date(now).toISOString(), trigger: 'manual' };
     const lease = this.handle.store.acquireLease();
@@ -135,9 +146,8 @@ export class ScheduleRunner {
     const { store } = this.handle;
     const lease = store.acquireLease();
     if (!lease) {
-      // Another cockpit holds the project; it will fire this occurrence. Move our own timer on
-      // without counting a failure.
-      if (options.advance) this.advance(definition, Date.parse(occurrence.at), now);
+      // The holder may only be editing a composer start, not launching this occurrence.
+      // Keep it due; the workspace scheduler applies its retry floor on contention.
       return { result: 'lease-held', occurrenceAt: occurrence.at };
     }
     try {

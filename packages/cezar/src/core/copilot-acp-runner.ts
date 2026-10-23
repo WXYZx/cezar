@@ -17,6 +17,7 @@ import {
 } from './agent-runner.ts';
 import { buildChildEnv } from './agent-env.ts';
 import { AcpClient, type AcpContentBlock, type AcpMessage, type AcpRequestAnswer } from './acp-client.ts';
+import { acpMcpCapabilities, skippedServersNote, toAcpMcpServers } from './private-mcp.ts';
 import { abortAcpTurn, endAcpReplay, mapAcpFrame, type AcpUiMapperState } from './acp-ui-mapper.ts';
 import { EOF_KILL_GRACE_MS, EOF_TERM_GRACE_MS } from './claude-cli-runner.ts';
 import {
@@ -26,6 +27,7 @@ import {
   isCopilotAuthFailure,
 } from './copilot-ui-mapper.ts';
 import type { UiEvent } from './ui-events.ts';
+import { spawnableCommand } from './windows-shim.ts';
 
 const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 /** `initialize` / `session/new` / `session/load` are handshakes: bounded, unlike a prompt. */
@@ -167,7 +169,8 @@ class CopilotAcpSession implements AgentSession {
     private readonly onEvent: ((event: AgentEvent) => void) | undefined,
     private readonly opts: SessionOptions,
   ) {
-    this.child = nodeSpawn(bin, buildCopilotArgs(spec), { cwd: spec.cwd, env: buildCopilotEnv(backend, spec.env) });
+    const [file, argv] = spawnableCommand(bin, buildCopilotArgs(spec));
+    this.child = nodeSpawn(file, argv, { cwd: spec.cwd, env: buildCopilotEnv(backend, spec.env) });
     this.pid = this.child.pid;
     this.hasExited = trackChildExit(this.child);
     this.child.on('error', (error: NodeJS.ErrnoException) => {
@@ -301,6 +304,10 @@ class CopilotAcpSession implements AgentSession {
     const caps = isRecord(init.agentCapabilities) ? init.agentCapabilities : {};
     this.loadSupported = caps.loadSession === true;
     this.imagesSupported = isRecord(caps.promptCapabilities) && caps.promptCapabilities.image === true;
+    const { mcpServers, skipped } = toAcpMcpServers(this.spec.mcpServers ?? [], acpMcpCapabilities(init));
+    if (skipped.length) {
+      this.emit({ type: 'note', message: skippedServersNote('copilot', skipped, 'the CLI did not advertise that MCP transport') });
+    }
 
     let resumed = false;
     if (this.spec.resume && this.spec.sessionId) {
@@ -309,7 +316,7 @@ class CopilotAcpSession implements AgentSession {
           this.replayDone = resolve;
         });
         try {
-          await this.client.loadSession(this.spec.sessionId, this.spec.cwd, HANDSHAKE_TIMEOUT_MS);
+          await this.client.loadSession(this.spec.sessionId, this.spec.cwd, HANDSHAKE_TIMEOUT_MS, mcpServers);
           this.acpSessionId = this.spec.sessionId;
           resumed = true;
           await Promise.race([replayEnded, delay(REPLAY_WAIT_MS)]);
@@ -327,7 +334,7 @@ class CopilotAcpSession implements AgentSession {
       }
     }
     if (!this.acpSessionId) {
-      const created = await this.client.newSession(this.spec.cwd, HANDSHAKE_TIMEOUT_MS).catch((error: unknown) => {
+      const created = await this.client.newSession(this.spec.cwd, HANDSHAKE_TIMEOUT_MS, mcpServers).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(
           isCopilotAuthFailure(`${message}\n${this.stderrText()}`)

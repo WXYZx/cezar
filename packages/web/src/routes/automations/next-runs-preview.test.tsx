@@ -49,10 +49,20 @@ describe('NextRunsPreview', () => {
     expect(screen.queryByText('This time has already passed.')).toBeNull()
   })
 
+  it('a one-time schedule with no date asks for one rather than calling it passed (#771)', () => {
+    // The schema leaves `date` optional, so a JSON-created `once` can arrive without one.
+    const { container } = render(
+      <NextRunsPreview kind="schedule" schedule={{ type: 'once', hour: 23 }} intervalSeconds={300} timeZone="Europe/Warsaw" now={NOW} />,
+    )
+    expect(container.querySelectorAll('[data-slot="next-run"]')).toHaveLength(0)
+    expect(screen.getByText('Pick a date.')).not.toBeNull()
+    expect(screen.queryByText('This time has already passed.')).toBeNull()
+  })
+
   it('describes the poll for a github kind', () => {
     render(<NextRunsPreview kind="github" schedule={{ type: 'daily' }} intervalSeconds={600} timeZone="Europe/Warsaw" now={NOW} />)
     expect(screen.getByText('How it polls')).not.toBeNull()
-    expect(screen.getByText(/Checks GitHub every 10 min while cezar is open/)).not.toBeNull()
+    expect(screen.getByText(/Checks GitHub every 10 min while this cockpit is open/)).not.toBeNull()
   })
 })
 

@@ -131,10 +131,12 @@ describe('ScheduleRunner', () => {
       expect(outcome.result).toBe('lease-held');
       expect(launch).not.toHaveBeenCalled();
       expect(store.logs({ automationId: 'nightly' })).toEqual([]);
-      expect(store.state('nightly')?.nextRunAt).toBe(new Date(FIRST_RUN + DAY).toISOString());
+      expect(store.state('nightly')?.nextRunAt).toBe(new Date(FIRST_RUN).toISOString());
     } finally {
       lease.release();
     }
+    expect((await runner.fire(definition)).result).toBe('launched');
+    expect(launch).toHaveBeenCalledOnce();
   });
 
   it('records a failed launch, advances, and auto-pauses after three in a row', async () => {
